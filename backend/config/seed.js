@@ -34,8 +34,8 @@ const seedData = async () => {
 
   const hash = await bcrypt.hash("demo1234", 10);
 
-  // Users
-  const users = await User.create([
+  // Users (insertMany bypasse le middleware pre("save") pour éviter le double hashage)
+  const users = await User.insertMany([
     {
       _id: "507f1f77bcf86cd799439011",
       name: "Youssef El Amrani",
