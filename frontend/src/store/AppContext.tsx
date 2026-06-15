@@ -8,25 +8,18 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import type {
-  AppNotification,
-  Company,
-  DB,
-  Role,
-  User,
-} from "../lib/types";
+import type { AppNotification, DB, Role, User } from "../lib/types";
 import {
   clearSession,
   loadDB,
   loadSession,
   loadTheme,
-  makeAccessToken,
-  resetDB,
   saveDB,
   saveSession,
   saveTheme,
 } from "../lib/db";
-import { pickColor, uid } from "../lib/format";
+import { uid } from "../lib/format";
+import { api } from "../lib/api";
 
 export interface Toast {
   id: string;
@@ -41,7 +34,6 @@ interface RegisterData {
   role: Role;
   phone?: string;
   filiere?: string;
-  // company
   companyName?: string;
   industry?: string;
   city?: string;
@@ -105,13 +97,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const notify = useCallback(
     (userId: string, n: Omit<AppNotification, "id" | "userId" | "read" | "createdAt">) => {
-      update((d) => {
-        d.notifications.unshift({
-          id: uid("n"),
-          userId,
-          read: false,
-          createdAt: new Date().toISOString(),
-          ...n,
+      // Try to persist to backend, fallback to local
+      api.createNotification({
+        userId,
+        read: false,
+        createdAt: new Date().toISOString(),
+        ...n,
+      }).catch(() => {
+        // fallback: local only
+        update((d) => {
+          d.notifications.unshift({
+            id: uid("n"),
+            userId,
+            read: false,
+            createdAt: new Date().toISOString(),
+            ...n,
+          });
         });
       });
     },
@@ -137,107 +138,84 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(
     async (email: string, password: string) => {
-      await new Promise((r) => setTimeout(r, 350));
-      const found = db.users.find(
-        (u) => u.email.toLowerCase() === email.trim().toLowerCase()
-      );
-      if (!found) return { ok: false, error: "Aucun compte trouvé avec cet email." };
-      if (!found.active) return { ok: false, error: "Ce compte est désactivé." };
-      if (found.password !== password) return { ok: false, error: "Mot de passe incorrect." };
-      const token = makeAccessToken(found);
-      const sess = {
-        token,
-        userId: found.id,
-        expiresAt: Date.now() + REFRESH_TTL,
-      };
-      saveSession(sess);
-      setSession(sess);
-      return { ok: true };
+      try {
+        const res = await api.login(email, password);
+        const { token, user: apiUser } = res;
+
+        // Upsert user in local db
+        update((d) => {
+          const idx = d.users.findIndex((u) => u.id === String(apiUser._id || apiUser.id));
+          const mappedUser: User = {
+            id: String(apiUser._id || apiUser.id),
+            name: apiUser.name,
+            email: apiUser.email,
+            password: "",
+            role: apiUser.role,
+            phone: apiUser.phone,
+            avatarColor: apiUser.avatarColor,
+            createdAt: apiUser.createdAt || new Date().toISOString(),
+            active: apiUser.active,
+            bio: apiUser.bio,
+            city: apiUser.city,
+            filiere: apiUser.filiere,
+            level: apiUser.level,
+            skills: apiUser.skills,
+            companyId: apiUser.companyId ? String(apiUser.companyId) : undefined,
+          };
+          if (idx >= 0) d.users[idx] = mappedUser;
+          else d.users.push(mappedUser);
+        });
+
+        const userId = String(apiUser._id || apiUser.id);
+        const sess = { token, userId, expiresAt: Date.now() + REFRESH_TTL };
+        saveSession(sess);
+        setSession(sess);
+        return { ok: true };
+      } catch (err: any) {
+        return { ok: false, error: err.message || "Erreur de connexion." };
+      }
     },
-    [db.users]
+    [update]
   );
 
   const register = useCallback(
     async (data: RegisterData) => {
-      await new Promise((r) => setTimeout(r, 450));
-      const email = data.email.trim().toLowerCase();
-      if (db.users.some((u) => u.email.toLowerCase() === email))
-        return { ok: false, error: "Cet email est déjà utilisé." };
+      try {
+        const res = await api.register(data);
+        const { token, user: apiUser } = res;
 
-      const userId = uid("u");
-      let companyId: string | undefined;
+        const userId = String(apiUser._id || apiUser.id);
 
-      if (data.role === "company") {
-        companyId = uid("c");
-        const company: Company = {
-          id: companyId,
-          name: data.companyName || data.name,
-          industry: data.industry || "—",
-          city: data.city || "—",
-          address: "—",
-          email: data.email,
-          phone: data.phone,
-          description: "",
-          logoColor: pickColor(data.companyName || email),
-          ownerUserId: userId,
-          partner: false,
-          createdAt: new Date().toISOString(),
-        };
         update((d) => {
-          d.companies.push(company);
+          const mappedUser: User = {
+            id: userId,
+            name: apiUser.name,
+            email: apiUser.email,
+            password: "",
+            role: apiUser.role,
+            phone: apiUser.phone,
+            avatarColor: apiUser.avatarColor,
+            createdAt: apiUser.createdAt || new Date().toISOString(),
+            active: apiUser.active,
+            bio: apiUser.bio,
+            city: apiUser.city,
+            filiere: apiUser.filiere,
+            level: apiUser.level,
+            skills: apiUser.skills,
+            companyId: apiUser.companyId ? String(apiUser.companyId) : undefined,
+          };
+          d.users.push(mappedUser);
         });
+
+        const sess = { token, userId, expiresAt: Date.now() + REFRESH_TTL };
+        saveSession(sess);
+        setSession(sess);
+        return { ok: true };
+      } catch (err: any) {
+        return { ok: false, error: err.message || "Erreur d'inscription." };
       }
-
-      const newUser: User = {
-        id: userId,
-        name: data.name,
-        email,
-        password: data.password,
-        role: data.role,
-        phone: data.phone,
-        avatarColor: pickColor(email),
-        createdAt: new Date().toISOString(),
-        active: true,
-        city: data.city,
-        filiere: data.role === "student" ? data.filiere : undefined,
-        level: data.role === "student" ? "Qualification (T1)" : undefined,
-        skills: data.role === "student" ? [] : undefined,
-        companyId,
-      };
-
-      update((d) => {
-        d.users.push(newUser);
-        d.notifications.unshift({
-          id: uid("n"),
-          userId,
-          title: "Bienvenue sur StageFlow 🎉",
-          message: "Votre compte a été créé avec succès. Complétez votre profil pour commencer.",
-          read: false,
-          type: "success",
-          createdAt: new Date().toISOString(),
-        });
-        // notify admin
-        const admin = d.users.find((u) => u.role === "admin");
-        if (admin) {
-          d.notifications.unshift({
-            id: uid("n"),
-            userId: admin.id,
-            title: "Nouvelle inscription",
-            message: `${newUser.name} (${newUser.role}) a rejoint la plateforme.`,
-            read: false,
-            type: "info",
-            createdAt: new Date().toISOString(),
-          });
-        }
-      });
-
-      const token = makeAccessToken(newUser);
-      const sess = { token, userId: newUser.id, expiresAt: Date.now() + REFRESH_TTL };
-      saveSession(sess);
-      setSession(sess);
-      return { ok: true };
     },
-    [db.users, update]
+    [update]
   );
 
   const logout = useCallback(() => {
@@ -247,7 +225,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const resetPassword = useCallback(
     async (email: string) => {
-      await new Promise((r) => setTimeout(r, 600));
+      // Backend ne supporte pas encore le reset par email — simulation locale
       const found = db.users.find(
         (u) => u.email.toLowerCase() === email.trim().toLowerCase()
       );
@@ -258,11 +236,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
 
   const resetData = useCallback(() => {
-    const fresh = resetDB();
+    // Local reset only — does not touch backend data
+    const fresh = loadDB();
     setDb(fresh);
     clearSession();
     setSession(null);
-    toast("Données de démonstration réinitialisées.", "info");
+    toast("Session réinitialisée.", "info");
   }, [toast]);
 
   const value: AppCtx = {
